@@ -30,6 +30,9 @@ def predict_instruments(audio_path, device='cuda' if torch.cuda.is_available() e
     # show audio
     ipd.Audio(audio, rate=sr)
 
+    # We chunk the audio into 10-second segments
+    # This helps ensure that our model inputs are of consistent size
+
     # Chunk size = 10 seconds
     chunk_size = 10 * sr
     num_chunks = len(audio) // chunk_size
@@ -48,7 +51,12 @@ def predict_instruments(audio_path, device='cuda' if torch.cuda.is_available() e
             # (B, C, T) assuming mono waveform input
             x = x.unsqueeze(0)
 
+            # Lets look at our model structure
+            # It's a basic encoder-decoder model
             preds = model(x)
+
+            # We predict the instrument class for each chunk
+
             # +1 to match dictionary keys
             pred_index = torch.argmax(preds, dim=1).item() + 1
             predicted_indices.append(pred_index)
@@ -58,6 +66,7 @@ def predict_instruments(audio_path, device='cuda' if torch.cuda.is_available() e
     instruments = [Reduced_inst_map[idx] for idx in unique_preds]
 
     # Print result
-    print("This audio was detected to have the following instruments:\n")
+    print("\n🎧 Detected Instruments\n" + "="*30)
     for inst in instruments:
-        print(f"- {inst}")
+        print(f"• {inst}")
+    print("="*30)
