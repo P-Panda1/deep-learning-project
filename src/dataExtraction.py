@@ -1,252 +1,192 @@
-from __future__ import print_function
-from subprocess import call
-import torch.utils.data as data
 import os
-import mmap
-import os.path
-import pickle
-import errno
-import csv
+import pandas as pd
+import librosa
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
 
-from intervaltree import IntervalTree
-from scipy.io import wavfile
+Reduced_inst_map = {
+    1: "Piano",
+    2: "Organ",
+    3: "Guitar",
+    4: "Bass",
+    5: "Strings",
+    6: "Brass",
+    7: "Reed",
+    8: "Pipe",
+    9: "Synth Lead",
+    10: "Other"
+}
+reduced_instruments_map = {
+    1: [1, 2, 3, 4, 5, 6, 7, 8],
+    2: [17, 18, 19, 20, 21, 22, 23, 24],
+    3: [25, 26, 27, 28, 29, 30, 31, 32],
+    4: [33, 34, 35, 36, 37, 38, 39, 40],
+    5: [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52],
+    6: [57, 58, 59, 60, 61, 62, 63, 64],
+    7: [65, 66, 67, 68, 69, 70, 71, 72],
+    8: [73, 74, 75, 76, 77, 78, 79, 80],
+    9: [81, 82, 83, 84, 85, 86, 87, 88],
+    10: [9, 10, 11, 12, 13, 14, 15, 16, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128]
+}
 
-sz_float = 4    # size of a float
-epsilon = 10e-8  # fudge factor for normalization
 
+class MusicNetDataset(Dataset):
+    def __init__(self, parent, sr=44100):
+        self.parent = parent
+        self.chunk_size = 10 * sr
+        self.data = []
 
-class MusicNet(data.Dataset):
-    """`MusicNet <http://homes.cs.washington.edu/~thickstn/musicnet.html>`_ Dataset.
-    Args:
-        root (string): Root directory of dataset
-        train (bool, optional): If True, creates dataset from ``train_data``,
-            otherwise from ``test_data``.
-        download (bool, optional): If true, downloads the dataset from the internet and
-            puts it in root directory. If dataset is already downloaded, it is not
-            downloaded again.
-        mmap (bool, optional): If true, mmap the dataset for faster access times.
-        normalize (bool, optional): If true, rescale input vectors to unit norm.
-        window (int, optional): Size in samples of a data point.
-        pitch_shift (int,optional): Integral pitch-shifting transformations.
-        jitter (int, optional): Continuous pitch-jitter transformations.
-        epoch_size (int, optional): Designated Number of samples for an "epoch"
-    """
-    url = 'https://zenodo.org/records/5120004/files/musicnet.tar.gz'
-    raw_folder = 'raw'
-    train_data, train_labels, train_tree = 'train_data', 'train_labels', 'train_tree.pckl'
-    test_data, test_labels, test_tree = 'test_data', 'test_labels', 'test_tree.pckl'
-    extracted_folders = [train_data, train_labels, test_data, test_labels]
+        for id in parent.ids:
+            audio, sr, labels = parent.access(id)
+            if sr != 44100:
+                print(f"Resampling {id} from {sr} to 44100")
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=44100)
+                sr = 44100
 
-    def __init__(self, root, train=True, download=False, refresh_cache=False, mmap=True, normalize=True, window=16384, pitch_shift=0, jitter=0., epoch_size=100000):
-        self.refresh_cache = refresh_cache
-        self.mmap = mmap
-        self.normalize = normalize
-        self.window = window
-        self.pitch_shift = pitch_shift
-        self.jitter = jitter
-        self.size = epoch_size
-        self.m = 128
+            duration = len(audio) / sr
+            num_chunks = int(duration // 10)
 
-        self.root = os.path.expanduser(root)
+            for i in range(num_chunks):
+                chunk_start = i * (10 * 44100)
+                chunk_end = (i+1) * (10 * 44100)
+                target = parent._process_labels(labels, chunk_start, chunk_end)
 
-        if download:
-            self.download()
-
-        if not self._check_exists():
-
-            raise RuntimeError('Dataset not found.' +
-                               ' You can use download=True to download it')
-
-        if train:
-            self.data_path = os.path.join(self.root, self.train_data)
-            labels_path = os.path.join(
-                self.root, self.train_labels, self.train_tree)
-        else:
-            self.data_path = os.path.join(self.root, self.test_data)
-            labels_path = os.path.join(
-                self.root, self.test_labels, self.test_tree)
-
-        with open(labels_path, 'rb') as f:
-            self.labels = pickle.load(f)
-
-        self.rec_ids = list(self.labels.keys())
-        self.records = dict()
-        self.open_files = []
-
-    def __enter__(self):
-        for record in os.listdir(self.data_path):
-            if not record.endswith('.bin'):
-                continue
-            if self.mmap:
-                fd = os.open(os.path.join(self.data_path, record), os.O_RDONLY)
-                buff = mmap.mmap(fd, 0, mmap.MAP_SHARED, mmap.PROT_READ)
-                self.records[int(record[:-4])] = (buff, len(buff)//sz_float)
-                self.open_files.append(fd)
-            else:
-                f = open(os.path.join(self.data_path, record))
-                self.records[int(record[:-4])] = (os.path.join(self.data_path,
-                                                               record), os.fstat(f.fileno()).st_size//sz_float)
-                f.close()
-
-    def __exit__(self, *args):
-        if self.mmap:
-            for mm in self.records.values():
-                mm[0].close()
-            for fd in self.open_files:
-                os.close(fd)
-            self.records = dict()
-            self.open_files = []
-
-    def access(self, rec_id, s, shift=0, jitter=0):
-        """
-        Args:
-            rec_id (int): MusicNet id of the requested recording
-            s (int): Position of the requested data point
-            shift (int, optional): Integral pitch-shift data transformation
-            jitter (float, optional): Continuous pitch-jitter data transformation
-        Returns:
-            tuple: (audio, target) where target is a binary vector indicating notes on at the center of the audio.
-        """
-
-        scale = 2.**((shift+jitter)/12.)
-
-        if self.mmap:
-            x = np.frombuffer(self.records[rec_id][0][s*sz_float:int(
-                s+scale*self.window)*sz_float], dtype=np.float32).copy()
-        else:
-            fid, _ = self.records[rec_id]
-            with open(fid, 'rb') as f:
-                f.seek(s*sz_float, os.SEEK_SET)
-                x = np.fromfile(f, dtype=np.float32,
-                                count=int(scale*self.window))
-
-        if self.normalize:
-            x /= np.linalg.norm(x) + epsilon
-
-        xp = np.arange(self.window, dtype=np.float32)
-        x = np.interp(scale*xp, np.arange(len(x),
-                      dtype=np.float32), x).astype(np.float32)
-
-        y = np.zeros(self.m, dtype=np.float32)
-        for label in self.labels[rec_id][s+scale*self.window/2]:
-            y[label.data[1]+shift] = 1
-
-        return x, y
-
-    def __getitem__(self, index):
-        """
-        Args:
-            index (int): (ignored by this dataset; a random data point is returned)
-        Returns:
-            tuple: (audio, target) where target is a binary vector indicating notes on at the center of the audio.
-        """
-
-        shift = 0
-        if self.pitch_shift > 0:
-            shift = np.random.randint(-self.pitch_shift, self.pitch_shift)
-
-        jitter = 0.
-        if self.jitter > 0:
-            jitter = np.random.uniform(-self.jitter, self.jitter)
-
-        rec_id = self.rec_ids[np.random.randint(0, len(self.rec_ids))]
-        s = np.random.randint(
-            0, self.records[rec_id][1]-(2.**((shift+jitter)/12.))*self.window)
-        return self.access(rec_id, s, shift, jitter)
+                self.data.append((
+                    id,
+                    chunk_start,
+                    chunk_end,
+                    target
+                ))
 
     def __len__(self):
-        return self.size
+        return len(self.data)
 
-    def _check_exists(self):
-        return os.path.exists(os.path.join(self.root, self.train_data)) and \
-            os.path.exists(os.path.join(self.root, self.test_data)) and \
-            os.path.exists(os.path.join(self.root, self.train_labels, self.train_tree)) and \
-            os.path.exists(os.path.join(self.root, self.test_labels, self.test_tree)) and \
-            not self.refresh_cache
+    def __getitem__(self, idx):
+        id, start, end, target = self.data[idx]
+        audio, sr, _ = self.parent.access(id)
+        chunk_start_sample = int(start * sr)
+        chunk_end_sample = int(end * sr)
+        chunk = audio[chunk_start_sample:chunk_end_sample]
 
-    def download(self):
-        """Download the MusicNet data if it doesn't exist in ``raw_folder`` already."""
-        from six.moves import urllib
-        import gzip
+        if len(chunk) != 10 * sr:
+            chunk = librosa.util.fix_length(chunk, size=10*sr)
 
-        if self._check_exists():
-            return
+        chunk_tensor = torch.FloatTensor(chunk)
+        chunk_tensor = (chunk_tensor - chunk_tensor.mean()) / \
+            (chunk_tensor.std() + 1e-8)
 
-        # download files
-        try:
-            os.makedirs(os.path.join(self.root, self.raw_folder))
-        except OSError as e:
-            if e.errno == errno.EEXIST:
-                pass
+        return chunk_tensor, torch.FloatTensor(target)
+
+
+class MusicNetLoader:
+    def __init__(self, root, label="train"):
+        self.root = Path(root)
+        self.label = label
+        self.data_dir = self.root / f"{label}_data"
+        self.label_dir = self.root / f"{label}_labels"
+        self.metadata = pd.read_csv(self.root / "musicnet_metadata.csv")
+        self.ids = [int(f.stem) for f in self.data_dir.glob("*.wav")]
+        self.reduced_instruments_map = {
+            1: [1, 2, 3, 4, 5, 6, 7, 8],
+            2: [17, 18, 19, 20, 21, 22, 23, 24],
+            3: [25, 26, 27, 28, 29, 30, 31, 32],
+            4: [33, 34, 35, 36, 37, 38, 39, 40],
+            5: [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52],
+            6: [57, 58, 59, 60, 61, 62, 63, 64],
+            7: [65, 66, 67, 68, 69, 70, 71, 72],
+            8: [73, 74, 75, 76, 77, 78, 79, 80],
+            9: [81, 82, 83, 84, 85, 86, 87, 88],
+            10: [9, 10, 11, 12, 13, 14, 15, 16, 89, 90, 91, 92, 93, 94,
+                 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106,
+                 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117,
+                 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128]
+        }
+
+        # Create reverse mapping for quick lookup
+        self.reverse_instrument_map = {}
+        for group, instruments in self.reduced_instruments_map.items():
+            for inst in instruments:
+                self.reverse_instrument_map[inst] = group
+
+        # Verify instrument mapping with actual data
+        self._validate_instrument_range()
+
+    def _validate_instrument_range(self):
+        """Check actual instrument values in labels"""
+        sample_labels = pd.read_csv(self.label_dir / f"{self.ids[0]}.csv")
+        instruments = sample_labels['instrument'].unique()
+        print(f"Found instrument IDs: {instruments}")
+        # Adjust this based on actual observations
+
+    def keys(self):
+        return self.ids
+
+    def access(self, id):
+        audio_path = self.data_dir / f"{id}.wav"
+        label_path = self.label_dir / f"{id}.csv"
+
+        audio, sr = librosa.load(audio_path, sr=None)
+        labels = pd.read_csv(label_path).astype({
+            'start_time': float,
+            'end_time': float,
+            'instrument': int
+        })
+
+        return audio, sr, labels
+
+    def _process_labels(self, labels, chunk_start, chunk_end):
+        """Map original instruments to reduced categories"""
+        # Filter labels overlapping with chunk
+        mask = (
+            (labels['start_time'] < chunk_end) &
+            (labels['end_time'] > chunk_start)
+        )
+        chunk_labels = labels[mask]
+        instruments = chunk_labels['instrument'].unique()
+
+        # Create multi-hot vector for 10 categories
+        target = np.zeros(10, dtype=np.float32)  # Now 10 classes
+        for inst in instruments:
+            group = self.reverse_instrument_map.get(inst)
+            if group is not None:
+                # Subtract 1 for 0-based indexing
+                target[group-1] = 1.0
             else:
-                raise
+                print(f"Warning: Instrument {inst} not in mapping")
 
-        filename = self.url.rpartition('/')[2]
-        file_path = os.path.join(self.root, self.raw_folder, filename)
-        if not os.path.exists(file_path):
-            print('Downloading ' + self.url)
-            data = urllib.request.urlopen(self.url)
-            with open(file_path, 'wb') as f:
-                # stream the download to disk (it might not fit in memory!)
-                while True:
-                    chunk = data.read(16*1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
+        return target
 
-        if not all(map(lambda f: os.path.exists(os.path.join(self.root, f)), self.extracted_folders)):
-            print('Extracting ' + filename)
-            if call(["tar", "-xf", file_path, '-C', self.root, '--strip', '1']) != 0:
-                raise OSError("Failed tarball extraction")
+    def get_loader(self, batch_size=500, sr=44100):
+        dataset = MusicNetDataset(self, sr=sr)
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
 
-        # process and save as torch files
-        print('Processing...')
+    def sample(self, id):
+        audio, sr, labels = self.access(id)
+        duration = len(audio) / sr
+        num_chunks = int(duration // 10)
 
-        self.process_data(self.test_data)
+        samples = []
+        for i in range(num_chunks):
+            start = i * (sr * 10)
+            end = start + (sr * 10)
+            target = self._process_labels(labels, start, end)
+            # Get group numbers (1-10) where present
+            active_groups = [i+1 for i, val in enumerate(target) if val == 1]
 
-        trees = self.process_labels(self.test_labels)
-        with open(os.path.join(self.root, self.test_labels, self.test_tree), 'wb') as f:
-            pickle.dump(trees, f)
+            samples.append({
+                'id': id,
+                'chunk_start': start,
+                'chunk_end': end,
+                'instrument_groups': active_groups,
+                'target': target
+            })
 
-        self.process_data(self.train_data)
-
-        trees = self.process_labels(self.train_labels)
-        with open(os.path.join(self.root, self.train_labels, self.train_tree), 'wb') as f:
-            pickle.dump(trees, f)
-
-        self.refresh_cache = False
-        print('Download Complete')
-
-    # write out wavfiles as arrays for direct mmap access
-    def process_data(self, path):
-        for item in os.listdir(os.path.join(self.root, path)):
-            if not item.endswith('.wav'):
-                continue
-            uid = int(item[:-4])
-            _, data = wavfile.read(os.path.join(self.root, path, item))
-            data.tofile(os.path.join(self.root, path, item[:-4]+'.bin'))
-
-    # wite out labels in intervaltrees for fast access
-    def process_labels(self, path):
-        trees = dict()
-        for item in os.listdir(os.path.join(self.root, path)):
-            if not item.endswith('.csv'):
-                continue
-            uid = int(item[:-4])
-            tree = IntervalTree()
-            with open(os.path.join(self.root, path, item), 'r') as f:
-                reader = csv.DictReader(f, delimiter=',')
-                for label in reader:
-                    start_time = int(label['start_time'])
-                    end_time = int(label['end_time'])
-                    instrument = int(label['instrument'])
-                    note = int(label['note'])
-                    start_beat = float(label['start_beat'])
-                    end_beat = float(label['end_beat'])
-                    note_value = label['note_value']
-                    tree[start_time:end_time] = (
-                        instrument, note, start_beat, end_beat, note_value)
-            trees[uid] = tree
-        return trees
+        return pd.DataFrame(samples)

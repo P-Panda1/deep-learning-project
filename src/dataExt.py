@@ -49,8 +49,8 @@ class MusicNetDataset(Dataset):
             num_chunks = int(duration // 10)
 
             for i in range(num_chunks):
-                chunk_start = i * 10
-                chunk_end = (i+1) * 10
+                chunk_start = i * (10 * 44100)
+                chunk_end = (i+1) * (10 * 44100)
                 target = parent._process_labels(labels, chunk_start, chunk_end)
 
                 self.data.append((
@@ -175,8 +175,8 @@ class MusicNetLoader:
 
         samples = []
         for i in range(num_chunks):
-            start = i * sr
-            end = start + sr
+            start = i * (sr * 10)
+            end = start + (sr * 10)
             target = self._process_labels(labels, start, end)
             # Get group numbers (1-10) where present
             active_groups = [i+1 for i, val in enumerate(target) if val == 1]
